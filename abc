@@ -1,0 +1,1133 @@
+<template>
+  <div>
+    <v-progress-linear
+      absolute
+      indeterminate
+      v-if="loadingAndSaving"
+    ></v-progress-linear>
+    <div
+      :id="tabId"
+      @dragover.prevent="onDebouncedDragOver"
+      @drop="drop"
+      @dragleave.prevent="dragLeave"
+    >
+      <grid-layout
+        ref="gridlayout"
+        :layout.sync="layout"
+        :col-num="2"
+        :row-height="rowHeight"
+        :is-draggable="false"
+        :isResizable="false"
+        :vertical-compact="true"
+        :use-css-transforms="false"
+        :margin="[3, 3]"
+        :style="containerStyle"
+        :preserveAspectRatio="true"
+      >
+        <v-skeleton-loader
+          v-if="loadingAndSaving && firstLoad"
+          type="image"
+          height="100%"
+        >
+        </v-skeleton-loader>
+        <v-card v-if="showAddWidgetsScreen" class="fill-height">
+          <v-container class="text-center fill-height" fluid>
+            <v-row align="center" justify="center" class="fill-height">
+              <v-col cols="12" class="text-center">
+                <v-icon
+                  v-text="swigEmptyBoxWithShadowIcon"
+                  max-height="300"
+                  max-width="300"
+                ></v-icon>
+                <h2 class="mt-4">Start building your report!</h2>
+                <v-btn
+                  class="mt-5 rounded"
+                  outlined
+                  color="primary"
+                  large
+                  @click="handleAction('openWidgetList')"
+                >
+                  Add New Report Widget
+                </v-btn>
+              </v-col>
+            </v-row>
+          </v-container>
+        </v-card>
+        <grid-item
+          :key="item.i"
+          @move="moveEvent"
+          v-for="item in layout"
+          :x="item.x"
+          :y="item.y"
+          :w="item.w"
+          :h="item.h"
+          :i="item.i"
+        >
+          <component
+            v-if="isWidgetCreated(item)"
+            :is="getComponent(item)"
+            v-bind="getComponentProps(item)"
+          ></component>
+          <v-card v-else class="fill-height">
+            <v-skeleton-loader type="image" height="100%"> </v-skeleton-loader>
+          </v-card>
+        </grid-item>
+      </grid-layout>
+    </div>
+  </div>
+</template>
+
+<script>
+import { GridItem, GridLayout } from 'vue-grid-layout'
+import ActionableMixin from '@/framework/views/mixins/ActionableMixin'
+import ConfigMixin from '@/framework/views/mixins/ConfigMixin'
+import { debounce } from '@/framework/util'
+import FormableMixin from '@/framework/views/mixins/FormableMixin'
+import ItemViewMixin from '@/framework/views/mixins/ItemViewMixin'
+import SetupViewStoreMixin from '@/framework/views/mixins/SetupViewStoreMixin'
+import ViewFactoryMixin from '@/framework/views/mixins/ViewFactoryMixin'
+import WidgetBuilding from '@/reports/components/WidgetBuilding.vue'
+import widgetTypes from '@/reports/config/enums/widgetTypes'
+
+// We are using `vue-grid-layout` to make a fluid layouts as per the requirements
+//Here is a link to the docs `https://jbaysolutions.github.io/vue-grid-layout/guide/properties.html`
+
+export default {
+  mixins: [
+    ConfigMixin,
+    FormableMixin,
+    ItemViewMixin,
+    ActionableMixin,
+    SetupViewStoreMixin,
+    ViewFactoryMixin
+  ],
+  components: {
+    GridLayout,
+    GridItem,
+    WidgetBuilding
+  },
+  props: {
+    height: Number,
+    activeTabName: String,
+    width: Number
+  },
+  data() {
+    return {
+      layout: [], //The actual layout we send to `Grid Layout` for rendering
+      layoutCopy: [], // Keeping a copy of the layout so we can set the layout as it was when `drag` function is called
+      newWidget: { x: 0, y: 0, w: 1, h: 1, i: 'newWidget' }, //New item config which needs to be added after dragging
+      isVerticalLayout: false, //To keep track of layout if its vertical or horizontal
+      tabId: 0, //We need a unique tab id so that we can use this code for multiple tabs. This is set in created.
+      setLayoutCopy: true,
+      items: widgetTypes.items,
+      initializedStores: [],
+      firstLoad: true
+    }
+  },
+  watch: {
+    activeTabName(newVal) {
+      if (newVal === this.item?.name) {
+        this.dispatch('updateCountInAppContext', {
+          count: this.tabWidgets?.length
+        })
+        //When we open side drawers and when tab is inactive the width is set to 0 and the code inside vue-grid-layout listens to resize of window and sets the width immediately
+        //so we add a delay and set the width again and call `onWindowResize` so that it does the width calculations again
+        setTimeout(() => {
+          this.$refs.gridlayout.width = `${this.width}px`
+          this.$refs.gridlayout.onWindowResize()
+        }, 30)
+      }
+    },
+    tabItem(newVal) {
+      if (!newVal) return
+      this.tabId = newVal.id
+    },
+    persistedLayout(nVal) {
+      //Setting all the data properties from here
+      this.layout = nVal || []
+      this.layoutCopy = structuredClone(this.layout)
+
+      if (nVal.length >= 2) {
+        const horizontallySplitWidget = nVal.find(item => item.h === 2)
+        if (horizontallySplitWidget) this.isVerticalLayout = true
+      }
+      this.dispatch('updateCountInAppContext', { count: nVal.length })
+    },
+    widgetConfigs(newVal, oldVal) {
+      if (!newVal || !oldVal) return
+      this.createStores(newVal)
+    }
+  },
+  created() {
+    this.onDebouncedDragOver = debounce(this.dragOver, 100, {
+      maxWait: 50
+    })
+  },
+  mounted() {
+    this.dispatch('fetch')
+  },
+  computed: {
+    showAddWidgetsScreen() {
+      return this.layout.length === 0 && !this.loadingAndSaving
+    },
+    widgetConfigs() {
+      return this.tabWidgetsConfig_items || []
+    },
+    tabWidgets() {
+      return this.tabWidgets_items || []
+    },
+    tabItem() {
+      return this.item ?? {}
+    },
+    swigEmptyBoxWithShadowIcon() {
+      return `$vuetify.icons.SwigEmptyBoxWithShadow`
+    },
+    //To set the `row-height` prop
+    rowHeight() {
+      return this.height / 2 - 10
+    },
+    //To set the container height
+    containerStyle() {
+      return {
+        height: `${this.height - 12}px`
+      }
+    },
+    persistedLayout() {
+      return (
+        this.item?.grid?.map(item => {
+          item.i = item.reportcontent // server saves id in `reportContent key and we need it as `i` for the grid-layout library`
+          return item
+        }) || []
+      )
+    },
+    loadingAndSaving() {
+      return (
+        this.storeState.loading ||
+        this.storeState.saving ||
+        this.tabWidgetsConfig_loading
+      )
+    }
+  },
+  methods: {
+    handleAction(action, item) {
+      this.delegateAction(action, item)
+    },
+    isWidgetCreated(widget) {
+      if (widget.reportcontent) return true
+      return false
+    },
+    getComponentProps(widget) {
+      const widgetObject = this.widgetConfigs.find(
+        item => item.id === widget.reportcontent
+      )
+      const widgetConfig = {
+        viewConfig: {
+          name: widgetObject?.id,
+          data: widgetObject?.data
+        },
+        viewNamespace: `${this.viewNamespace}.${widgetObject?.id}`,
+        route: { params: this.route.params },
+        params: this.route.params,
+        timeZone: this.timeZone
+      }
+      return widgetConfig
+    },
+    getComponent(widget) {
+      const widgetObject = this.widgetConfigs.find(
+        item => item.id === widget.reportcontent
+      )
+      const contentType = widgetObject?.contentType?.toLowerCase()
+      if (widgetObject?.componentNotIntegrated) {
+        return 'WidgetBuilding'
+      }
+      return this.getView(contentType)
+    },
+    createStores(widgets) {
+      widgets.forEach(widget => {
+        const newWidget = {
+          ...widget,
+          name: widget.id
+        }
+        const storeExist = this.initializedStores.find(
+          ini => ini.id === newWidget.id
+        )
+        if (!storeExist) {
+          this.setupViewStores([newWidget])
+          this.initializedStores.push(newWidget)
+        }
+      })
+      if (this.firstLoad) this.firstLoad = false
+    },
+    dragLeave(e) {
+      // We set the style `pointerEvents` in dragOver in `reportCoversheet` as tinymce renders iframe which does not emit dragover event
+      // So by adding `pointerEvents` we get the dragOver event from iFrame.
+      if (e.currentTarget.contains(e.relatedTarget)) return
+
+      const iFrameElements = document.querySelectorAll('.tox-edit-area__iframe')
+      if (iFrameElements.length) {
+        iFrameElements.forEach(iFrame => {
+          iFrame.style.removeProperty('pointer-events')
+        })
+      }
+
+      this.setLayoutCopy = true
+      this.onDebouncedDragOver.cancel()
+      this.$refs.gridlayout.dragEvent(
+        'dragend',
+        'newWidget',
+        this.newWidget.x,
+        this.newWidget.y,
+        this.newWidget.h,
+        this.newWidget.w
+      )
+      this.layout = structuredClone(this.layoutCopy)
+    },
+    dragOver(e) {
+      if (!e.dataTransfer) return //To ignore the effect of event bubbling from child
+
+      e.dataTransfer.dropEffect = 'move'
+      if (this.setLayoutCopy) {
+        this.layoutCopy = structuredClone(this.layout)
+        this.setLayoutCopy = false
+      }
+      //Find the container and find relative x and y to calculate quadrant and if mouse is in the grid
+      const parentRect = document
+        .getElementById(`${this.tabId}`)
+        .getBoundingClientRect()
+      const x = e.clientX - parentRect.left
+      const y = e.clientY - parentRect.top
+
+      this.layout = structuredClone(this.layoutCopy)
+      if (this.layout.length === 0) {
+        //If its the first element then it should take entire space available
+        this.newWidget = {
+          x: 0,
+          y: 0,
+          w: 2,
+          h: 2,
+          i: 'newWidget'
+        }
+      } else if (this.layout.length === 1) {
+        //This code is to add second element
+        if (
+          y >= parentRect.height * 0.15 &&
+          y <= parentRect.height * 0.85 &&
+          x > 0 &&
+          x < parentRect.width * 0.15
+        ) {
+          //verticalLeft
+          this.layout[0] = { ...this.layout[0], w: 1, x: 1 }
+          this.newWidget = { x: 0, y: 0, w: 1, h: 2, i: 'newWidget' }
+          this.isVerticalLayout = true
+        } else if (
+          y >= parentRect.height * 0.15 &&
+          y <= parentRect.height * 0.85 &&
+          x > parentRect.width * 0.85 &&
+          x < parentRect.width
+        ) {
+          //verticalRight
+          this.layout[0] = { ...this.layout[0], w: 1 }
+          this.newWidget = { x: 1, y: 0, w: 1, h: 2, i: 'newWidget' }
+          this.isVerticalLayout = true
+        } else if (
+          y >= 0 &&
+          y <= parentRect.height * 0.15 &&
+          x > parentRect.width * 0.15 &&
+          x < parentRect.width * 0.85
+        ) {
+          //horizontalTop
+          this.layout[0] = { ...this.layout[0], h: 1, y: 1 }
+          this.newWidget = { x: 0, y: 0, w: 2, h: 1, i: 'newWidget' }
+          this.isVerticalLayout = false
+        } else if (
+          y >= parentRect.height * 0.85 &&
+          y <= parentRect.height &&
+          x > parentRect.width * 0.15 &&
+          x < parentRect.width * 0.85
+        ) {
+          //horizontalBottom
+          this.layout[0] = { ...this.layout[0], h: 1 }
+          this.newWidget = { x: 0, y: 1, w: 2, h: 1, i: 'newWidget' }
+          this.isVerticalLayout = false
+        } else {
+          this.resetLayoutAndRemoveHighlight()
+          return
+        }
+      } else if (this.layout.length === 2) {
+        if (
+          y >= 0 &&
+          y <= parentRect.height * 0.1 &&
+          x >= parentRect.width * 0.15 &&
+          x <= parentRect.width * 0.85
+        ) {
+          //A
+          if (this.isVerticalLayout) {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.x === 0
+            )
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.x === 1
+            )
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              y: 1,
+              h: 1
+            }
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              y: 1,
+              h: 1
+            }
+            this.newWidget = { x: 0, y: 0, w: 2, h: 1, i: 'newWidget' }
+          } else {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.y === 0
+            )
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.y === 1
+            )
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              y: 1,
+              w: 1,
+              h: 1
+            }
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              x: 1,
+              y: 1,
+              h: 1,
+              w: 1
+            }
+            this.newWidget = { x: 0, y: 0, w: 2, h: 1, i: 'newWidget' }
+          }
+        } else if (
+          y >= parentRect.height * 0.9 &&
+          y <= parentRect.height &&
+          x >= parentRect.width * 0.15 &&
+          x <= parentRect.width * 0.85
+        ) {
+          //H
+          if (this.isVerticalLayout) {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.x === 0
+            )
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.x === 1
+            )
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              h: 1
+            }
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              h: 1
+            }
+            this.newWidget = { x: 0, y: 1, w: 2, h: 1, i: 'newWidget' }
+          } else {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.y === 0
+            )
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.y === 1
+            )
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              w: 1,
+              h: 1
+            }
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              x: 1,
+              y: 0,
+              h: 1,
+              w: 1
+            }
+            this.newWidget = { x: 0, y: 1, w: 2, h: 1, i: 'newWidget' }
+          }
+        } else if (
+          y >= parentRect.height * 0.1 &&
+          y <= parentRect.height * 0.9 &&
+          x >= 0 &&
+          x <= parentRect.width * 0.1
+        ) {
+          //B
+          if (this.isVerticalLayout) {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.x === 0
+            )
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.x === 1
+            )
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              h: 1,
+              x: 1
+            }
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              h: 1,
+              y: 1
+            }
+            this.newWidget = { x: 0, y: 0, w: 1, h: 2, i: 'newWidget' }
+          } else {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.y === 0
+            )
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.y === 1
+            )
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              w: 1,
+              x: 1
+            }
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              x: 1,
+              w: 1
+            }
+            this.newWidget = { x: 0, y: 0, w: 1, h: 2, i: 'newWidget' }
+          }
+        } else if (
+          y >= parentRect.height * 0.1 &&
+          y <= parentRect.height * 0.9 &&
+          x >= parentRect.width * 0.9 &&
+          x <= parentRect.width
+        ) {
+          //E
+          if (this.isVerticalLayout) {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.x === 0
+            )
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.x === 1
+            )
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              h: 1
+            }
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              h: 1,
+              y: 1,
+              x: 0
+            }
+            this.newWidget = { x: 1, y: 0, w: 1, h: 2, i: 'newWidget' }
+          } else {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.y === 0
+            )
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.y === 1
+            )
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              w: 1
+            }
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              w: 1
+            }
+            this.newWidget = { x: 1, y: 0, w: 1, h: 2, i: 'newWidget' }
+          }
+        } else if (
+          y >= parentRect.height * 0.1 &&
+          y <= parentRect.height * 0.5 &&
+          x >= parentRect.width * 0.1 &&
+          x <= parentRect.width * 0.4
+        ) {
+          //c
+          if (this.isVerticalLayout) {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.x === 0
+            )
+
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              h: 1,
+              y: 1
+            }
+
+            this.newWidget = { x: 0, y: 0, w: 1, h: 1, i: 'newWidget' }
+          } else {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.y === 0
+            )
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.y === 1
+            )
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              y: 1,
+              w: 1,
+              h: 1
+            }
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              w: 1,
+              h: 2,
+              x: 1,
+              y: 0
+            }
+            this.newWidget = { x: 0, y: 0, w: 1, h: 1, i: 'newWidget' }
+          }
+        } else if (
+          y >= parentRect.height * 0.5 &&
+          y <= parentRect.height * 0.9 &&
+          x >= parentRect.width * 0.1 &&
+          x <= parentRect.width * 0.4
+        ) {
+          //F
+          if (this.isVerticalLayout) {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.x === 0
+            )
+
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              h: 1
+            }
+
+            this.newWidget = { x: 0, y: 1, w: 1, h: 1, i: 'newWidget' }
+          } else {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.y === 0
+            )
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.y === 1
+            )
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              w: 1
+            }
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              w: 1,
+              h: 2,
+              x: 1,
+              y: 0
+            }
+            this.newWidget = { x: 0, y: 1, w: 1, h: 1, i: 'newWidget' }
+          }
+        } else if (
+          y >= parentRect.height * 0.5 &&
+          y <= parentRect.height * 0.9 &&
+          x >= parentRect.width * 0.6 &&
+          x <= parentRect.width * 0.9
+        ) {
+          //G
+          if (this.isVerticalLayout) {
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.x === 1
+            )
+
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              h: 1
+            }
+            this.newWidget = { x: 1, y: 1, w: 1, h: 1, i: 'newWidget' }
+          } else {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.y === 0
+            )
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.y === 1
+            )
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              w: 1,
+              h: 2
+            }
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              w: 1,
+              x: 1,
+              y: 0
+            }
+            this.newWidget = { x: 1, y: 1, w: 1, h: 1, i: 'newWidget' }
+          }
+        } else if (
+          y >= parentRect.height * 0.1 &&
+          y <= parentRect.height * 0.5 &&
+          x >= parentRect.width * 0.6 &&
+          x <= parentRect.width * 0.9
+        ) {
+          //D
+          if (this.isVerticalLayout) {
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.x === 1
+            )
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              h: 1,
+              y: 1
+            }
+            this.newWidget = { x: 1, y: 0, w: 1, h: 1, i: 'newWidget' }
+          } else {
+            const indexOfWidget1 = this.layout.findIndex(
+              widget => widget.y === 0
+            )
+            const indexOfWidget2 = this.layout.findIndex(
+              widget => widget.y === 1
+            )
+            this.layout[indexOfWidget1] = {
+              ...this.layout[indexOfWidget1],
+              w: 1,
+              h: 2,
+              y: 0
+            }
+            this.layout[indexOfWidget2] = {
+              ...this.layout[indexOfWidget2],
+              w: 1,
+              h: 1,
+              x: 1,
+              y: 1
+            }
+            this.newWidget = { x: 1, y: 0, w: 1, h: 1, i: 'newWidget' }
+          }
+        } else {
+          this.resetLayoutAndRemoveHighlight()
+          return
+        }
+      } else if (this.layout.length === 3) {
+        //Identify the existing layout
+        let existingLayoutType = ''
+        let fullWidgetIndex = ''
+        this.layout.forEach((widget, i) => {
+          if (widget.x === 0 && widget.y === 0 && widget.h === 2) {
+            fullWidgetIndex = i
+            existingLayoutType = 'verticalLeftFull'
+          } else if (widget.x === 1 && widget.y === 0 && widget.h === 2) {
+            existingLayoutType = 'verticalRightFull'
+            fullWidgetIndex = i
+          } else if (widget.x === 0 && widget.y === 0 && widget.w === 2) {
+            fullWidgetIndex = i
+            existingLayoutType = 'horizontalTopFull'
+          } else if (widget.x === 0 && widget.y === 1 && widget.w === 2) {
+            fullWidgetIndex = i
+            existingLayoutType = 'horizontalBottomFull'
+          }
+        })
+        if (
+          y >= 0 &&
+          y <= parentRect.height * 0.4 &&
+          x >= 0 &&
+          x <= parentRect.width * 0.4
+        ) {
+          //A
+          if (existingLayoutType === 'verticalLeftFull') {
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              h: 1,
+              y: 1
+            }
+            this.newWidget = { x: 0, y: 0, h: 1, w: 1, i: 'newWidget' }
+          } else if (existingLayoutType === 'verticalRightFull') {
+            let lowerLeftWidgetIndex = ''
+            let upperLeftWidgetIndex = ''
+            this.layout.forEach((widget, i) => {
+              if (widget.x === 0 && widget.y === 0) upperLeftWidgetIndex = i
+              else if (widget.x === 0 && widget.y === 1)
+                lowerLeftWidgetIndex = i
+            })
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              h: 1
+            }
+            this.layout[lowerLeftWidgetIndex] = {
+              ...this.layout[lowerLeftWidgetIndex],
+              x: 1
+            }
+            this.layout[upperLeftWidgetIndex] = {
+              ...this.layout[upperLeftWidgetIndex],
+              y: 1
+            }
+            this.newWidget = { x: 0, y: 0, h: 1, w: 1, i: 'newWidget' }
+          } else if (existingLayoutType === 'horizontalTopFull') {
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              w: 1,
+              x: 1
+            }
+            this.newWidget = { x: 0, y: 0, h: 1, w: 1, i: 'newWidget' }
+          } else if (existingLayoutType === 'horizontalBottomFull') {
+            let topLeftWidgetIndex = ''
+            this.layout.forEach((widget, i) => {
+              if (widget.x === 0 && widget.y === 0) {
+                topLeftWidgetIndex = i
+              }
+            })
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              w: 1,
+              x: 1
+            }
+            this.layout[topLeftWidgetIndex] = {
+              ...this.layout[topLeftWidgetIndex],
+              y: 1
+            }
+            this.newWidget = { x: 0, y: 0, h: 1, w: 1, i: 'newWidget' }
+          }
+        } else if (
+          y >= 0 &&
+          y <= parentRect.height * 0.4 &&
+          x >= parentRect.width * 0.6 &&
+          x <= parentRect.width
+        ) {
+          //B
+          if (existingLayoutType === 'verticalLeftFull') {
+            let LeftTopWidgetIndex = ''
+            let LeftBottomWidgetIndex = ''
+
+            this.layout.forEach((widget, i) => {
+              if (widget.x === 1 && widget.y === 0) LeftTopWidgetIndex = i
+              else if (widget.x === 1 && widget.y === 1)
+                LeftBottomWidgetIndex = i
+            })
+
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              h: 1
+            }
+            this.layout[LeftTopWidgetIndex] = {
+              ...this.layout[LeftTopWidgetIndex],
+              y: 1
+            }
+            this.layout[LeftBottomWidgetIndex] = {
+              ...this.layout[LeftBottomWidgetIndex],
+              x: 0
+            }
+            this.newWidget = { x: 1, y: 0, h: 1, w: 1, i: 'newWidget' }
+          } else if (existingLayoutType === 'verticalRightFull') {
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              h: 1,
+              y: 1
+            }
+            this.newWidget = { x: 1, y: 0, h: 1, w: 1, i: 'newWidget' }
+          } else if (existingLayoutType === 'horizontalTopFull') {
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              w: 1
+            }
+            this.newWidget = { x: 1, y: 0, h: 1, w: 1, i: 'newWidget' }
+          } else if (existingLayoutType === 'horizontalBottomFull') {
+            let topRightWidgetIndex = ''
+            this.layout.forEach((widget, i) => {
+              if (widget.x === 1 && widget.y === 0) {
+                topRightWidgetIndex = i
+              }
+            })
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              w: 1
+            }
+            this.layout[topRightWidgetIndex] = {
+              ...this.layout[topRightWidgetIndex],
+              y: 1
+            }
+            this.newWidget = { x: 1, y: 0, h: 1, w: 1, i: 'newWidget' }
+          }
+        } else if (
+          y >= parentRect.height * 0.6 &&
+          y <= parentRect.height &&
+          x >= 0 &&
+          x <= parentRect.width * 0.4
+        ) {
+          if (existingLayoutType === 'verticalLeftFull') {
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              h: 1,
+              y: 0
+            }
+            this.newWidget = { x: 0, y: 1, h: 1, w: 1, i: 'newWidget' }
+          } else if (existingLayoutType === 'verticalRightFull') {
+            let bottomLeftWidget = ''
+            this.layout.forEach((widget, i) => {
+              if (widget.x === 0 && widget.y === 1) {
+                bottomLeftWidget = i
+              }
+            })
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              h: 1
+            }
+            this.layout[bottomLeftWidget] = {
+              ...this.layout[bottomLeftWidget],
+              x: 1
+            }
+            this.newWidget = { x: 0, y: 1, h: 1, w: 1, i: 'newWidget' }
+          } else if (existingLayoutType === 'horizontalTopFull') {
+            let bottomLeftWidget = ''
+            let bottomRightWidget = ''
+            this.layout.forEach((widget, i) => {
+              if (widget.x === 0 && widget.y === 1) {
+                bottomLeftWidget = i
+              } else if (widget.x === 1 && widget.y === 1) {
+                bottomRightWidget = i
+              }
+            })
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              w: 1
+            }
+            this.layout[bottomRightWidget] = {
+              ...this.layout[bottomRightWidget],
+              y: 0
+            }
+            this.layout[bottomLeftWidget] = {
+              ...this.layout[bottomLeftWidget],
+              x: 1
+            }
+            this.newWidget = { x: 0, y: 1, h: 1, w: 1, i: 'newWidget' }
+          } else if (existingLayoutType === 'horizontalBottomFull') {
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              w: 1,
+              x: 1
+            }
+            this.newWidget = { x: 0, y: 1, h: 1, w: 1, i: 'newWidget' }
+          }
+        } else if (
+          y >= parentRect.height * 0.6 &&
+          y <= parentRect.height &&
+          x >= parentRect.width * 0.6 &&
+          x <= parentRect.width
+        ) {
+          if (existingLayoutType === 'verticalLeftFull') {
+            let bottomRightWidgetIndex = ''
+            this.layout.forEach((widget, i) => {
+              if (widget.x === 1 && widget.y === 1) {
+                bottomRightWidgetIndex = i
+              }
+            })
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              h: 1
+            }
+            this.layout[bottomRightWidgetIndex] = {
+              ...this.layout[bottomRightWidgetIndex],
+              x: 0
+            }
+            this.newWidget = { x: 1, y: 1, h: 1, w: 1, i: 'newWidget' }
+          } else if (existingLayoutType === 'verticalRightFull') {
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              h: 1
+            }
+            this.newWidget = { x: 1, y: 1, h: 1, w: 1, i: 'newWidget' }
+          } else if (existingLayoutType === 'horizontalTopFull') {
+            let bottomRightWidgetIndex = ''
+            this.layout.forEach((widget, i) => {
+              if (widget.x === 1 && widget.y === 1) {
+                bottomRightWidgetIndex = i
+              }
+            })
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              w: 1
+            }
+            this.layout[bottomRightWidgetIndex] = {
+              ...this.layout[bottomRightWidgetIndex],
+              y: 0
+            }
+
+            this.newWidget = { x: 1, y: 1, h: 1, w: 1, i: 'newWidget' }
+          } else if (existingLayoutType === 'horizontalBottomFull') {
+            this.layout[fullWidgetIndex] = {
+              ...this.layout[fullWidgetIndex],
+              w: 1
+            }
+            this.newWidget = { x: 1, y: 1, h: 1, w: 1, i: 'newWidget' }
+          }
+        } else {
+          this.resetLayoutAndRemoveHighlight()
+          return
+        }
+      }
+
+      if (this.layout.findIndex(item => item.i === 'newWidget') === -1) {
+        this.layout.push({
+          ...this.newWidget
+        })
+      }
+      const index = this.layout.findIndex(item => item.i === 'newWidget')
+      if (index !== -1) {
+        try {
+          this.$refs.gridlayout.$children[
+            this.layout.length
+          ].$refs.item.style.display = 'none'
+        } catch (err) {
+          return
+        }
+        const el = this.$refs.gridlayout.$children[index]
+        el.dragging = {
+          top: e.clientY - parentRect.top,
+          left: e.clientX - parentRect.left
+        }
+        const new_pos = el.calcXY(
+          e.clientY - parentRect.top,
+          e.clientX - parentRect.left
+        )
+
+        this.$refs.gridlayout.dragEvent(
+          'dragstart',
+          'newWidget',
+          new_pos.x,
+          new_pos.y,
+          this.newWidget.h,
+          this.newWidget.w
+        )
+      }
+      e.preventDefault()
+    },
+    drop(e) {
+      //remove the css style pointer-events when item is dropped which was added in `ReportCoversheet.vue`
+      const iFrameElements = document.querySelectorAll('.tox-edit-area__iframe')
+      if (iFrameElements.length) {
+        iFrameElements.forEach(iFrame => {
+          iFrame.style.removeProperty('pointer-events')
+        })
+      }
+      const selectedType = e.dataTransfer.getData('text')
+      if (!selectedType) {
+        //If there is no type then set the layout again and return
+        this.layout = structuredClone(this.layoutCopy)
+      }
+      this.newWidget['type'] = selectedType
+      //cancel existing drag calls
+      this.setLayoutCopy = true
+      this.onDebouncedDragOver.cancel()
+      const parentRect = document
+        .getElementById(`${this.tabId}`)
+        .getBoundingClientRect()
+      let mouseInGrid = false
+      if (
+        e.clientX > parentRect.left &&
+        e.clientX < parentRect.right &&
+        e.clientY > parentRect.top &&
+        e.clientY < parentRect.bottom
+      ) {
+        mouseInGrid = true
+      }
+      if (mouseInGrid) {
+        this.$refs.gridlayout.dragEvent(
+          'dragend',
+          'newWidget',
+          this.newWidget.x,
+          this.newWidget.y,
+          this.newWidget.h,
+          this.newWidget.w
+        )
+        this.$refs.gridlayout.dragEvent(
+          'dragend',
+          this.layout.length,
+          this.newWidget.x,
+          this.newWidget.y,
+          this.newWidget.h,
+          this.newWidget.w
+        )
+        try {
+          this.$refs.gridlayout.$children[
+            this.layout.length
+          ].$refs.item.style.display = 'block'
+        } catch {
+          return
+        }
+        this.layoutCopy = []
+        this.lastVisitedQuadrant = ''
+        this.saveLayout(this.newWidget)
+      }
+      // Reset the data properties
+      this.layoutCopy = []
+    },
+    resetLayoutAndRemoveHighlight() {
+      this.$refs.gridlayout.dragEvent(
+        'dragend',
+        'newWidget',
+        this.newWidget.x,
+        this.newWidget.y,
+        this.newWidget.h,
+        this.newWidget.w
+      )
+      this.layout = structuredClone(this.layoutCopy)
+    },
+    //Swapping elements horizontally shifts the entire layout by adding extra row, this avoids that
+    moveEvent(i, newX, newY) {
+      const movedLayoutItem = this.layout.find(item => item.reportcontent === i)
+      let p
+      for (p = 0; p < this.layout.length; p++) {
+        //Horizontal swapping
+        if (
+          newX >= this.layout[p]['x'] &&
+          newX < this.layout[p]['x'] + this.layout[p]['w'] &&
+          movedLayoutItem['y'] === this.layout[p]['y'] &&
+          i !== this.layout[p]['i']
+        ) {
+          const initialX = movedLayoutItem['x']
+          const finalX = this.layout[p]['x']
+          movedLayoutItem['x'] = finalX
+          this.layout[p]['x'] = initialX
+        }
+        //Vertical swapping
+        if (
+          newY >= this.layout[p]['y'] &&
+          newY < this.layout[p]['y'] + 1 &&
+          movedLayoutItem['x'] === this.layout[p]['x'] &&
+          i !== this.layout[p]['i']
+        ) {
+          const initialY = movedLayoutItem['y']
+          const finalY = this.layout[p]['y']
+          movedLayoutItem['y'] = finalY
+          this.layout[p]['y'] = initialY
+        }
+      }
+      this.saveLayout()
+    },
+
+    //Save the layout when new element is dropped and swapped
+    saveLayout(newWidget) {
+      const layoutConfig = {
+        layout: this.layout.map(item => {
+          //This key is added by vue-grid-layout library and we need to remove it before sending it to the server
+          delete item.moved
+          return item
+        }),
+        newWidget,
+        tabWidgets: this.tabWidgets
+      }
+      this.dispatch('saveLayout', layoutConfig)
+    }
+  }
+}
+</script>
+
+<style scoped>
+.vue-grid-item:not(.vue-grid-placeholder) {
+  display: flex;
+  width: 100%;
+}
+
+.vue-grid-item .resizing {
+  opacity: 0.9;
+}
+
+.vue-grid-item .static {
+  background: #cce;
+}
+
+.vue-grid-item .no-drag {
+  height: 100%;
+  width: 100%;
+}
+:deep(.vue-grid-item.vue-grid-placeholder) {
+  background: rgb(70, 150, 236) !important;
+}
+.draggableMouseCursor {
+  cursor: grab;
+}
+.draggableMouseCursor:active {
+  cursor: grabbing;
+}
+</style>
